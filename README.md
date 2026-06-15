@@ -144,14 +144,18 @@ Example layout:
 ```bash
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git ../LIBERO
 
-# Create and install the LIBERO simulator environment following the official
-# LIBERO instructions. Then set:
+# Create the LIBERO simulator environment with Python 3.10, then install
+# LIBERO following the official instructions.
+conda create -n libero python=3.10 -y
+conda activate libero
+
+# Then set:
 export LIBERO_HOME=/path/to/LIBERO
 export LIBERO_PYTHON=/path/to/libero_env/bin/python
 ```
 
 After completing the official LIBERO installation, install the MuJoCo version
-used by this repository in the LIBERO simulator environment:
+used by this repository in the Python 3.10 LIBERO simulator environment:
 
 ```bash
 conda activate <libero_env>
