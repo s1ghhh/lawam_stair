@@ -1,10 +1,10 @@
-run_id: libero_4in1_pretrain
-run_root_dir: results/Checkpoints/libero
+run_id: robotwin
+run_root_dir: results/Checkpoints/robotwin
 seed: 2026
 trackers:
 - wandb
 wandb_entity: null
-wandb_project: finetune-LIBERO
+wandb_project: finetune-RoboTwin
 is_debug: false
 framework:
   name: LaWAM
@@ -24,7 +24,7 @@ framework:
     enable_flow_h_t1_scheduled_sampling: false
     flow_h_t1_pred_prob_start: 0.0
     flow_h_t1_pred_prob_end: 1.0
-    flow_h_t1_pred_ramp_steps: 10000
+    flow_h_t1_pred_ramp_steps: 20000
     detach_future_feature: true
     future_prediction: true
     enable_loss_distill: true
@@ -38,7 +38,6 @@ framework:
       hidden_dim: 1024
       attention_heads: 16
       num_layers: 16
-      num_target_vision_tokens: -1
       interleave_self_attention: true
       use_alternate_vldit: true
       attend_text_every_n_blocks: 2
@@ -46,31 +45,28 @@ framework:
       cfg_guidance_scale: 1.0
       num_inference_steps: 10
       num_timestep_buckets: 1000
-      horizon_sec: 0.4
+      horizon_sec: 1.2
       noise_beta_alpha: 1.5
       noise_beta_beta: 1.0
       noise_s: 0.999
-      token_independent_noise: false
       use_action_positional_embeddings: true
 datasets:
   vla_data:
     data_root_dir: dataset
-    data_mix: libero
+    data_mix: robotwin_eef_30hz
     image_resolution: 256
-    per_device_batch_size: 32
-    val_tail_ratio: 0.01
-    train_split_all: true
+    per_device_batch_size: 16
     video_backend: pyav
     num_frames: 2
     enable_primary_video_aug: false
     enable_primary_random_resized_crop: false
-    sec_chunk: 0.4
+    sec_chunk: 1.2
     enable_video_frame_cache: false
 trainer:
-  max_train_steps: 30000
-  num_warmup_steps: 1500
-  save_interval: 30000
-  eval_interval: 500
+  max_train_steps: 100000
+  num_warmup_steps: 2000
+  save_interval: 100000
+  eval_interval: 1000
   eval_batches: 20
   learning_rate:
     base: 0.0001
@@ -79,7 +75,7 @@ trainer:
       modules:
       - policy_backend.flow
     world_model:
-      lr: 0.0001
+      lr: 0.0003
       modules:
       - policy_backend.lam.decoder
     vlm:
@@ -98,9 +94,9 @@ trainer:
     unfreeze_vision_merger: true
     unfreeze_llm_last_n_layers: -1
     unfreeze_lam_decoder: true
-  logging_frequency: 100
+  logging_frequency: 200
   gradient_clipping: 1.0
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   ddp_find_unused_parameters: false
   optimizer:
     betas:
