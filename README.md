@@ -1,6 +1,12 @@
 # LaWAM: Latent World Action Models for Efficient Dynamics-Aware Robot Policies
 
-This repository contains the cleaned training and evaluation code for **LaWAM**,
+[![arXiv](https://img.shields.io/badge/arXiv-2606.15768-b31b1b.svg)](https://arxiv.org/abs/2606.15768)
+[![Project Page](https://img.shields.io/badge/Project_Page-LaWAM-2ea44f.svg)](https://rlinf.github.io/LaWAM/)
+[![Hugging Face Model Collection](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model%20Collection-f7c843)](https://huggingface.co/collections/jialei02/lawam-checkpoints)
+[![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/jialei02/libero_merged_no_noops_20hz)
+[![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/jialei02/robotwin_merged)
+
+This repository contains the training and evaluation code for **LaWAM**,
 a **La**tent **W**orld **A**ction **M**odel for robot policies. LaWAM predicts
 future observation features in a frozen visual feature space and injects them as
 latent visual subgoals for action generation.
@@ -28,7 +34,6 @@ LaWAM policy training with latent visual subgoals.
   - [LIBERO](#libero-sft)
   - [RoboTwin](#robotwin-sft)
 - [Checkpoint Notes](#checkpoint-notes)
-- [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
 
 ## File Structure
@@ -464,19 +469,6 @@ are valid in the new environment.
 - `framework.action_model.lam_ckpt_path` and
   `framework.action_model.lam_yaml_path` must point to a matching LAM checkpoint
   and YAML config.
-
-## Citation
-
-```bibtex
-@misc{chen2026lawam,
-  title = {LaWAM: Latent World Action Models for Efficient Dynamics-Aware Robot Policies},
-  author = {Chen, Jialei and Wang, Kai and Chen, Kang and Chen, Shuaihang and Gao, Feng and Tang, Wenhao and Li, Zhiyuan and Liu, Weilin and Yao, Zhuyu and Li, Boxun and Xu, Yuanbo and Yu, Chao},
-  journal = {arXiv preprint arXiv:2606.15768},
-  year = {2026},
-  archiveprefix = {arXiv},
-  primaryclass = {cs.RO},
-}
-```
 
 ## Acknowledgements
 
