@@ -14,6 +14,23 @@ from typing import Any, Optional
 import imageio
 import numpy as np
 
+# PyTorch 2.6+ 把 torch.load 默认 weights_only 从 False 改成 True, 会让 LIBERO 的
+# get_task_init_states -> torch.load(init_states_path) (含 numpy 对象) 抛 UnpicklingError。
+# 在本 eval 进程内全局兜底: 未显式指定时强制 weights_only=False (尊重显式传参)。
+import functools as _functools
+import torch as _torch
+
+if not getattr(_torch.load, "_wo_compat_patched", False):
+    _orig_torch_load = _torch.load
+
+    @_functools.wraps(_orig_torch_load)
+    def _torch_load_compat(*args, **kwargs):
+        kwargs.setdefault("weights_only", False)
+        return _orig_torch_load(*args, **kwargs)
+
+    _torch_load_compat._wo_compat_patched = True
+    _torch.load = _torch_load_compat
+
 from examples.LIBERO.eval_files.libero_benchmark_adapters import (
     BenchmarkAdapter,
     get_benchmark_adapter,
