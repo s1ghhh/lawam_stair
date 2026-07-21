@@ -1,3 +1,4 @@
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -810,6 +811,17 @@ class LatentWorldPolicyBackend(nn.Module):
         if num_inference_steps is None:
             num_inference_steps = int(self.flow.config.num_inference_steps)
 
+        # Eval-time decode-scheme overrides (set on the model server process):
+        #   LAWAM_NUM_INFERENCE_STEPS: int, overrides the denoise step count.
+        #   LAWAM_DECODE_MODE: std (default) | has (FASTER horizon-aware schedule)
+        #                      | readout (er50 staircase early decode).
+        steps_env = os.environ.get("LAWAM_NUM_INFERENCE_STEPS", "").strip()
+        if steps_env:
+            num_inference_steps = int(steps_env)
+        decode_mode = os.environ.get("LAWAM_DECODE_MODE", "std").strip().lower()
+        if decode_mode not in ("std", "has", "readout"):
+            raise ValueError(f"Invalid LAWAM_DECODE_MODE: {decode_mode!r} (std|has|readout).")
+
         shared = self._run_shared_encoding_infer(
             prepared_batch=prepared_batch,
             source="LatentWorldPolicyBackend.predict_action",
@@ -830,7 +842,12 @@ class LatentWorldPolicyBackend(nn.Module):
                 num_inference_steps=num_inference_steps,
                 attention_mask=attn_flow,
                 return_padded=bool(return_padded),
+                return_early_readout=(decode_mode == "readout"),
+                time_schedule=("has" if decode_mode == "has" else "const"),
             )
+        if decode_mode == "readout":
+            actions, early_readout = actions
+            actions = early_readout["staircase_actions"]
 
         if not return_intermediates:
             return actions

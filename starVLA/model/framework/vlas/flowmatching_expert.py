@@ -10,7 +10,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -192,6 +192,22 @@ class ConditionalFlowMatchingConfig:
     noise_s: float = 0.999
     token_independent_noise: bool = False
 
+    # --- Denoising-scheme comparison flags (all defaults keep official behavior) ---
+    # One-step training: fix flow time tau for every sample/position (e.g. 0.0
+    # trains pure noise -> action regression; inference uses num_inference_steps=1).
+    fixed_train_tau: Optional[float] = None
+    # FASTER-style Horizon-Aware Schedule (HAS). In LaWAM convention (tau=1 clean)
+    # the warp is tau_i = clip(tau / (1 - u_i), 0, 1) with u_i = (1 - j^alpha) * u0,
+    # j = i / (H_valid - 1): front positions finish denoising early, rear positions
+    # use the full budget. `has_train_mix_prob` is the per-sample probability of
+    # training on the warped (vs shared) tau; the same alpha/u0 drive inference.
+    has_train_mix_prob: float = 0.0
+    has_alpha: float = 1.0
+    has_u0: float = 0.9
+    # er50 early-readout auxiliary loss: velocity MSE reweighted by (1 - tau)^2,
+    # the exact endpoint error of the one-jump readout x1 = x_tau + (1-tau) * v.
+    early_readout_loss_weight: float = 0.0
+
 
 class ConditionalFlowMatchingHead(nn.Module):
     def __init__(self, config: Optional[ConditionalFlowMatchingConfig] = None):
@@ -367,6 +383,40 @@ class ConditionalFlowMatchingHead(nn.Module):
         sample = (1.0 - sample) * float(self.config.noise_s)
         return sample.to(dtype=dtype)
 
+    def _has_warp_tau(self, time: torch.Tensor, token_valid: torch.Tensor) -> torch.Tensor:
+        """FASTER Horizon-Aware Schedule in LaWAM tau convention (tau=1 clean).
+
+        time: [B, 1, 1] shared tau; token_valid: [B, T] bool. Returns [B, T, 1]:
+        tau_i = clip(tau / (1 - u_i), 0, 1), u_i = (1 - j^alpha) * u0. Position 0
+        (u=u0) reaches tau=1 once the global tau passes 1-u0; the last valid
+        position (u=0) keeps the unwarped tau.
+        """
+        seq_len = int(token_valid.shape[1])
+        h_eff = token_valid.to(torch.float32).sum(dim=1).clamp_min(2.0)  # [B]
+        idx = torch.arange(seq_len, device=time.device, dtype=torch.float32)[None, :]
+        j = (idx / (h_eff[:, None] - 1.0)).clamp(0.0, 1.0)
+        u = (1.0 - j ** float(self.config.has_alpha)) * float(self.config.has_u0)  # [B, T]
+        warped = (time.squeeze(-1) / (1.0 - u).clamp_min(1e-6)).clamp(0.0, 1.0)
+        return warped.unsqueeze(-1).to(dtype=time.dtype)
+
+    def _has_time_schedule(
+        self, num_steps: int, valid_horizon: int, seq_len: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Precompute the HAS inference schedule.
+
+        Returns (tau_sched [S+1, T], dt_sched [S, T]) over the padded horizon;
+        positions beyond `valid_horizon` follow the last valid column (masked out
+        downstream anyway). Front positions take one big first step and then sit
+        clean (dt=0); the last position integrates uniformly over all S steps.
+        """
+        idx = torch.arange(seq_len, device=device, dtype=torch.float32)
+        j = (idx / float(max(valid_horizon - 1, 1))).clamp(0.0, 1.0)
+        u = (1.0 - j ** float(self.config.has_alpha)) * float(self.config.has_u0)  # [T]
+        grid = torch.linspace(0.0, 1.0, num_steps + 1, device=device)  # global tau 0 -> 1
+        tau_sched = (grid[:, None] / (1.0 - u)[None, :].clamp_min(1e-6)).clamp(0.0, 1.0)
+        dt_sched = tau_sched[1:] - tau_sched[:-1]
+        return tau_sched, dt_sched
+
     
     def forward(
         self,
@@ -411,13 +461,26 @@ class ConditionalFlowMatchingHead(nn.Module):
             time = self.sample_time(actions.shape[0], device, actions.dtype)
             time = time[:, None, None]
 
+        # One-step training: every sample/position trains at a fixed tau.
+        fixed_tau = getattr(self.config, "fixed_train_tau", None)
+        if fixed_tau is not None:
+            time = torch.full_like(time, float(fixed_tau))
+
+        # FASTER-style HAS: with prob has_train_mix_prob, warp the shared tau into
+        # the per-position inference schedule (front near-clean, rear noisy).
+        has_prob = float(getattr(self.config, "has_train_mix_prob", 0.0))
+        if has_prob > 0.0 and time.shape[1] == 1:
+            warped = self._has_warp_tau(time, data_token_valid)  # [B, T, 1]
+            use_has = torch.rand(batch_size, 1, 1, device=device) < has_prob
+            time = torch.where(use_has, warped, time.expand_as(warped))
+
         # Flow matching path: x_t=(1-t)z+tx, velocity target is constant along the path.
         x_t = (1 - time) * noise + time * actions
         velocity_target = actions - noise
         # Clamp bucket ids before passing them to the DiT timestep embedding.
         t_discretized = (time.squeeze(-1) * self.config.num_timestep_buckets).long()
         t_discretized = torch.clamp(t_discretized, 0, self.config.num_timestep_buckets - 1)
-        if not self.config.token_independent_noise:
+        if t_discretized.shape[1] == 1:
             t_discretized = t_discretized[:, 0]
 
         # The time grid determines which padded action tokens are valid for each action_hz.
@@ -484,7 +547,8 @@ class ConditionalFlowMatchingHead(nn.Module):
                 future_token_count=future_token_count,
             )
         dit_timestep = t_discretized
-        if self.config.token_independent_noise:
+        if t_discretized.dim() == 2:
+            # Per-position timesteps (token-independent noise or HAS-warped tau).
             dit_timestep = self._build_hidden_timesteps(
                 action_timesteps=t_discretized,
                 token_valid=token_valid,
@@ -564,6 +628,14 @@ class ConditionalFlowMatchingHead(nn.Module):
         valid = valid * robot_valid.view(-1, 1, 1)
         denom = valid.sum().clamp_min(1.0)
         losses = (loss_elem * valid).sum() / denom
+        readout_weight = float(getattr(self.config, "early_readout_loss_weight", 0.0))
+        if readout_weight > 0.0:
+            # || x_tau + (1-tau) v_pred - x1 ||^2 == (1-tau)^2 || v_pred - v_target ||^2,
+            # so the early-readout objective is the velocity loss reweighted toward low tau.
+            # `time` is [B,1,1] (shared) or [B,T,1] (per-position); both broadcast.
+            readout_w = (1.0 - time.to(dtype=loss_elem.dtype)) ** 2
+            loss_readout = (loss_elem * readout_w * valid).sum() / denom
+            losses = losses + readout_weight * loss_readout
         return losses
 
     @torch.inference_mode()
@@ -580,7 +652,9 @@ class ConditionalFlowMatchingHead(nn.Module):
         num_inference_steps: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         return_padded: bool = False,
-    ) -> torch.Tensor:
+        return_early_readout: bool = False,
+        time_schedule: str = "const",
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         device = h_t.device
         model_dtype = self._compute_dtype()
         h_t = self._cast_if_needed(h_t, model_dtype)
@@ -629,6 +703,20 @@ class ConditionalFlowMatchingHead(nn.Module):
 
         dt = 1.0 / float(num_inference_steps)
 
+        if time_schedule not in ("const", "has"):
+            raise ValueError(f"Invalid time_schedule: {time_schedule!r} (const|has).")
+        if return_early_readout and time_schedule != "const":
+            raise ValueError("return_early_readout requires time_schedule='const'.")
+        has_tau_sched = has_dt_sched = None
+        if time_schedule == "has":
+            has_tau_sched, has_dt_sched = self._has_time_schedule(
+                num_steps=int(num_inference_steps),
+                valid_horizon=int(base_horizon),
+                seq_len=int(action_horizon),
+                device=device,
+            )
+        early_readout_per_step: list = []
+
         cond_vlm = self.enc_vlm(h_vlm)  # [B, seq_len, vision_dim]
         cond_state = self._prepare_state_condition(
             state=state,
@@ -676,13 +764,30 @@ class ConditionalFlowMatchingHead(nn.Module):
             ], dim=1)
 
         for step in range(num_inference_steps):
-            t_cont = step / float(num_inference_steps)
-            t_discretized = int(t_cont * self.config.num_timestep_buckets)
-            t_discretized = min(self.config.num_timestep_buckets - 1, max(0, t_discretized))
+            future_token_count_ts = 0 if future_tokens is None else int(future_tokens.shape[1])
+            if time_schedule == "has":
+                # Per-position timesteps from the HAS schedule (finished positions
+                # sit at the last bucket and receive dt=0 below).
+                action_timesteps = (
+                    (has_tau_sched[step] * self.config.num_timestep_buckets)
+                    .long()
+                    .clamp(0, self.config.num_timestep_buckets - 1)[None, :]
+                    .expand(batch_size, -1)
+                )
+                timesteps_tensor = self._build_hidden_timesteps(
+                    action_timesteps=action_timesteps,
+                    token_valid=time_valid,
+                    has_state_token=bool(self.config.use_state),
+                    future_token_count=future_token_count_ts,
+                )
+            else:
+                t_cont = step / float(num_inference_steps)
+                t_discretized = int(t_cont * self.config.num_timestep_buckets)
+                t_discretized = min(self.config.num_timestep_buckets - 1, max(0, t_discretized))
 
-            timesteps_tensor = torch.full(
-                size=(batch_size,), fill_value=t_discretized, device=device, dtype=torch.long
-            )
+                timesteps_tensor = torch.full(
+                    size=(batch_size,), fill_value=t_discretized, device=device, dtype=torch.long
+                )
             action_features = self.action_encoder(x_t, embodiment_id)
             time_emb = self.time_encoder(t_grid).to(dtype=action_features.dtype)
             action_time_emb = time_emb * time_valid.unsqueeze(-1).to(dtype=action_features.dtype)
@@ -781,7 +886,39 @@ class ConditionalFlowMatchingHead(nn.Module):
                     pred_velocity = pred_velocity_cond
 
             pred_velocity = pred_velocity * time_valid.unsqueeze(-1).to(dtype=pred_velocity.dtype)
-            x_t = x_t + dt * pred_velocity
+            if time_schedule == "has":
+                x_t = x_t + has_dt_sched[step][None, :, None].to(dtype=x_t.dtype) * pred_velocity
+            else:
+                x_t = x_t + dt * pred_velocity
             x_t = x_t * time_valid.unsqueeze(-1).to(dtype=x_t.dtype)
+
+            if return_early_readout:
+                # Ahead-of-time decode: freeze the current velocity and jump the
+                # remaining flow time in one step. Pure side-channel readout; the
+                # main denoising trajectory above is untouched.
+                tau_after = float(step + 1) * dt
+                x1_hat = x_t + (1.0 - tau_after) * pred_velocity
+                x1_hat = x1_hat * time_valid.unsqueeze(-1).to(dtype=x1_hat.dtype)
+                early_readout_per_step.append(x1_hat[:, :output_horizon, :])
+
+        if return_early_readout:
+            # Staircase assembly: split the output horizon into `num_inference_steps`
+            # groups by execution order; group g is decoded from the readout of
+            # iteration g (earlier groups exit earlier, later groups get more steps).
+            num_groups = int(num_inference_steps)
+            staircase = torch.empty_like(early_readout_per_step[-1])
+            group_bounds = [
+                (g * output_horizon) // num_groups for g in range(num_groups + 1)
+            ]
+            for g in range(num_groups):
+                lo, hi = group_bounds[g], group_bounds[g + 1]
+                if lo < hi:
+                    staircase[:, lo:hi, :] = early_readout_per_step[g][:, lo:hi, :]
+            readout = {
+                "staircase_actions": staircase,
+                "per_step_x1_pred": torch.stack(early_readout_per_step, dim=0),
+                "group_bounds": torch.tensor(group_bounds, dtype=torch.long),
+            }
+            return x_t[:, :output_horizon, :], readout
 
         return x_t[:, :output_horizon, :]
