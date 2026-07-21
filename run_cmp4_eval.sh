@@ -1,66 +1,100 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 四种去噪方式公平对比 —— 评测入口 (libero_10, 默认每任务 50 trials = 500 episodes)
+# cmp4 评测核心调度器 —— 一个变体, 把 (suite × setting) 的 job 按 GPU 池分批挂
 #
-# 每个 ckpt 跑三个口径 (server 端用 LAWAM_DECODE_MODE/LAWAM_NUM_INFERENCE_STEPS
-# 控制解码方式, client 端用 EVAL_ACTION_CHUNK_LEN 控制每次执行几个动作):
-#   std5_exec10 : 标准 5 步去噪, 执行前 10 个动作 (receding) —— 质量上限, 四个
-#                 ckpt 协议完全一致, 用于确认训练本身没掉点
-#   fast_exec10 : 各自的原生快速解码, 执行前 10 个 ——
-#                   onestep    -> 1 步标准去噪
-#                   has        -> FASTER 时间表 5 步 (队头 1 步就绪)
-#                   eraux/base -> er50 阶梯读出 (前 10 = 组0 的 1 步等效外推)
-#   fast_exec50 : 同 fast 模式, 一次执行整个 50 chunk (开环, 看后段质量)
+# 每个变体的 inference = 训练匹配的原生解码 (server 端 LAWAM_DECODE_MODE/STEPS):
+#     onestep -> std 1 步 | has -> HAS 5 步 | eraux/base -> readout 5 步
+# 两个 setting (client 端 EVAL_ACTION_CHUNK_LEN, 每次执行几个动作):
+#     exec50 -> 50 全执行(开环) | exec20 -> 前 20(receding)
 #
-# 用法:
-#   bash run_cmp4_eval.sh <onestep|has|eraux|base> [ckpt路径]
-#   环境变量: GPU(默认1) | TRIALS(默认50) | SUITES(默认libero_10) | NUM_WORKERS(默认8)
-#             SKIP_MODES="std5_exec10 ..." 跳过已有结果
-# 产出: results/eval_runs/cmp4/<变体>__<口径>/...
+# job = 每个 suite × 每个 setting。指定 n 个 GPU, 每张卡一次一个 job,
+# 一批占满 n 张卡、跑完再下一批 (分 ceil(job/n) 批)。
+#   例: GPUS=4,5 + 4 suite × 2 setting = 8 job -> 分 4 批
+#
+# 用法:  GPUS=4,5 bash run_cmp4_eval.sh <onestep|has|eraux|base> [ckpt]
+#   变量: GPUS(必填) | TRIALS(默认10) | SUITES(默认4个) | NUM_WORKERS(默认8)
+# 产出: results/eval_runs/cmp4/<变体>__<suite>__<setting>/...
 # =============================================================================
 set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
 
-VARIANT="${1:?用法: bash run_cmp4_eval.sh <onestep|has|eraux|base> [ckpt]}"
-case "${VARIANT}" in onestep|has|eraux|base) ;; *) echo "[错误] 未知变体 ${VARIANT}" >&2; exit 1;; esac
+VARIANT="${1:?用法: GPUS=4,5 bash run_cmp4_eval.sh <onestep|has|eraux|base> [ckpt]}"
+case "$VARIANT" in onestep|has|eraux|base) ;; *) echo "[错误] 未知变体 $VARIANT" >&2; exit 1;; esac
+CKPT="${2:-${CKPT:-$(ls -dt results/Checkpoints/libero/*+cmp4_${VARIANT}/final_model/pytorch_model.pt 2>/dev/null | head -1)}}"
+[[ -n "$CKPT" && -f "$CKPT" ]] || { echo "[错误] 找不到 $VARIANT 的 ckpt, 请显式传入" >&2; exit 1; }
 
-# ckpt: 显式给出, 或自动取最新的 cmp4_<变体> 产出
-CKPT="${2:-$(ls -dt results/Checkpoints/libero/*+cmp4_${VARIANT}/final_model/pytorch_model.pt 2>/dev/null | head -1)}"
-[[ -n "${CKPT}" && -f "${CKPT}" ]] || { echo "[错误] 找不到 ${VARIANT} 的 ckpt, 请显式传入" >&2; exit 1; }
-
-GPU="${GPU:-1}"
-TRIALS="${TRIALS:-50}"
+GPUS="${GPUS:?请指定 GPU 列表, 如 GPUS=4,5}"
+read -r -a GPU_ARR <<< "${GPUS//,/ }"
+N=${#GPU_ARR[@]}
+TRIALS="${TRIALS:-10}"
+SUITES="${SUITES:-libero_10 libero_goal libero_object libero_spatial}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 OUT="results/eval_runs/cmp4"
+mkdir -p logs/cmp4_eval
 
 export LIBERO_HOME="${LIBERO_HOME:-/workspace/000000_lawam/LIBERO}"
 export LIBERO_PYTHON="${LIBERO_PYTHON:-/opt/conda/envs/libero_lawam/bin/python}"
 export STAR_VLA_PYTHON="${STAR_VLA_PYTHON:-/opt/conda/envs/lawam/bin/python}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
-# 变体 -> 快速解码方式
-case "${VARIANT}" in
-  onestep) FAST_MODE=std;     FAST_STEPS=1 ;;
-  has)     FAST_MODE=has;     FAST_STEPS=5 ;;
-  eraux|base) FAST_MODE=readout; FAST_STEPS=5 ;;
+case "$VARIANT" in
+  onestep) MODE=std;     STEPS=1 ;;
+  has)     MODE=has;     STEPS=5 ;;
+  eraux|base) MODE=readout; STEPS=5 ;;
 esac
+SETTINGS=("exec50:50" "exec20:20")
 
-run_mode() {
-  local tag="$1" mode="$2" steps="$3" exec_len="$4"
-  [[ " ${SKIP_MODES:-} " == *" ${tag} "* ]] && { echo "===== 跳过 ${VARIANT}/${tag}"; return; }
-  echo "===== ${VARIANT}/${tag} | decode=${mode} steps=${steps} exec=${exec_len} | ${CKPT}"
-  LAWAM_DECODE_MODE="${mode}" LAWAM_NUM_INFERENCE_STEPS="${steps}" \
-  EVAL_ACTION_CHUNK_LEN="${exec_len}" \
-  SUITES="${SUITES:-libero_10}" NUM_TRIALS_PER_TASK="${TRIALS}" \
-  NUM_WORKERS="${NUM_WORKERS:-8}" GPU_IDS="${GPU}" \
-  OUTPUT_ROOT="${OUT}" LIBERO_CKPT_ALIAS="${VARIANT}__${tag}" \
-  bash examples/LIBERO/eval_files/auto_eval_scripts/run_libero_benchmark.sh "${CKPT}"
+# ---- 构造 job 列表: "suite|tag|exec_len" -----------------------------------
+jobs=()
+for suite in $SUITES; do
+  for s in "${SETTINGS[@]}"; do
+    jobs+=("${suite}|${s%%:*}|${s##*:}")
+  done
+done
+NJOBS=${#jobs[@]}
+NBATCH=$(( (NJOBS + N - 1) / N ))
+echo "[cmp4/$VARIANT] GPUS=$GPUS (n=$N) | $(echo $SUITES|wc -w) suite × ${#SETTINGS[@]} setting = $NJOBS job | 分 $NBATCH 批 | decode=$MODE/${STEPS}步"
+echo "  ckpt=$CKPT"
+
+run_one() {   # gpu suite tag exec_len run_index
+  local gpu="$1" suite="$2" tag="$3" ex="$4" ridx="$5"
+  local alias="${VARIANT}__${suite}__${tag}"
+  echo "  -> GPU$gpu | $suite | $tag(exec=$ex) | log=logs/cmp4_eval/${alias}.log"
+  LAWAM_DECODE_MODE="$MODE" LAWAM_NUM_INFERENCE_STEPS="$STEPS" \
+  EVAL_ACTION_CHUNK_LEN="$ex" \
+  SUITES="$suite" NUM_TRIALS_PER_TASK="$TRIALS" NUM_WORKERS="$NUM_WORKERS" \
+  GPU_IDS="$gpu" RUN_INDEX_BASE="$ridx" \
+  OUTPUT_ROOT="$OUT" LIBERO_CKPT_ALIAS="$alias" \
+  bash examples/LIBERO/eval_files/auto_eval_scripts/run_libero_benchmark.sh "$CKPT" \
+    > "logs/cmp4_eval/${alias}.log" 2>&1
 }
 
-run_mode "std5_exec10" std             5              10
-run_mode "fast_exec10" "${FAST_MODE}"  "${FAST_STEPS}" 10
-run_mode "fast_exec50" "${FAST_MODE}"  "${FAST_STEPS}" 50
-
-echo "===================== ${VARIANT} 汇总 ====================="
-for tag in std5_exec10 fast_exec10 fast_exec50; do
-  E=$(ls -t ${OUT}/${VARIANT}__${tag}/*/suites/*/eval.log 2>/dev/null | head -1)
-  [[ -n "${E}" ]] && echo "${tag}: $(grep -oE 'success_rate=[0-9.]+' "${E}" | tail -1)" || echo "${tag}: (无结果)"
+# ---- 分批调度: 每批占满 n 张卡, wait 完再下一批 ----------------------------
+i=0; batch=0
+while (( i < NJOBS )); do
+  batch=$((batch+1)); pids=()
+  echo "===== 批 $batch/$NBATCH [$(date +%H:%M:%S)] ====="
+  for (( k=0; k<N && i<NJOBS; k++, i++ )); do
+    IFS='|' read -r suite tag ex <<< "${jobs[i]}"
+    run_one "${GPU_ARR[k]}" "$suite" "$tag" "$ex" "$i" &
+    pids+=("$!")
+  done
+  for p in "${pids[@]}"; do wait "$p" || echo "  [批$batch] 有 job 非0退出 (见对应 log)"; done
 done
+
+# ---- 汇总: suite × setting -> total_success_rate ---------------------------
+echo; echo "======== $VARIANT 汇总 (decode=$MODE/${STEPS}步, TRIALS=$TRIALS) ========"
+printf '%-18s' "suite"; for s in "${SETTINGS[@]}"; do printf '%-12s' "${s%%:*}"; done; echo
+for suite in $SUITES; do
+  printf '%-18s' "$suite"
+  for s in "${SETTINGS[@]}"; do
+    alias="${VARIANT}__${suite}__${s%%:*}"
+    sj=$(ls -t "$OUT/$alias"/*/suites/*/summary.json 2>/dev/null | head -1 || true)
+    if [[ -n "$sj" ]]; then
+      sr=$("$STAR_VLA_PYTHON" -c "import json;print(f\"{json.load(open('$sj'))['total_success_rate']:.3f}\")" 2>/dev/null || echo NA)
+    else sr=NA; fi
+    printf '%-12s' "$sr"
+  done
+  echo
+done
+echo "==================================================================="
