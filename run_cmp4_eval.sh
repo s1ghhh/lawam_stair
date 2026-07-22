@@ -35,10 +35,9 @@ mkdir -p logs/cmp4_eval
 export LIBERO_HOME="${LIBERO_HOME:-/workspace/000000_lawam/LIBERO}"
 export LIBERO_PYTHON="${LIBERO_PYTHON:-/opt/conda/envs/libero_lawam/bin/python}"
 export STAR_VLA_PYTHON="${STAR_VLA_PYTHON:-/opt/conda/envs/lawam/bin/python}"
-# 不强制 MUJOCO_GL: 交回底层按 num_workers 自动选 (多 worker->osmesa, 单 worker->egl),
-# 因为 EGL 在多进程 offscreen worker / 部分机器上会初始化失败。
-# 想强制渲染后端就外部传, 如 MUJOCO_GL=osmesa bash eval_onestep.sh ...
-[[ -n "${MUJOCO_GL:-}" ]] && export MUJOCO_GL || true
+# 渲染后端默认 egl (和 LaWAM_v2/eval_scripts/dispatch_matrix.sh 一致 —— 绝大多数机器
+# egl 正常; egl 下底层会自动把 num_workers 降到 1)。个别 egl 坏的机器再外部传 MUJOCO_GL=osmesa。
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 case "$VARIANT" in
   onestep) MODE=std;     STEPS=1 ;;
